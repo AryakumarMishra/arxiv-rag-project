@@ -64,6 +64,13 @@ class OpenSearchClient:
         results = {}
         results["hybrid_index"] = self._create_hybrid_index(force)
         results["rrf_pipeline"] = self._create_rrf_pipeline(force)
+        # Ensure mapping contains fields needed for uploaded document support
+        try:
+            self._ensure_metadata_fields()
+            results["mapping_updated"] = True
+        except Exception as e:
+            logger.warning(f"Failed to ensure metadata fields in mapping: {e}")
+            results["mapping_updated"] = False
         return results
 
     def _create_hybrid_index(self, force: bool = False) -> bool:
@@ -88,6 +95,35 @@ class OpenSearchClient:
         except Exception as e:
             logger.error(f"Error creating hybrid index: {e}")
             raise
+
+    def _ensure_metadata_fields(self) -> None:
+        """Add metadata.source and metadata.document_id to mapping if missing."""
+        try:
+            mapping = self.client.indices.get_mapping(index=self.index_name)
+            props = (
+                mapping.get(self.index_name, {})
+                .get("mappings", {})
+                .get("properties", {})
+            )
+            metadata_def = props.get("metadata")
+            # If no metadata field or missing subfields, put mapping
+            if not metadata_def or not isinstance(metadata_def, dict) or not metadata_def.get("properties"):
+                update_body = {
+                    "properties": {
+                        "metadata": {
+                            "type": "object",
+                            "dynamic": "strict",
+                            "properties": {
+                                "source": {"type": "keyword"},
+                                "document_id": {"type": "keyword"},
+                            },
+                        }
+                    }
+                }
+                self.client.indices.put_mapping(index=self.index_name, body=update_body)
+                logger.info("Updated mapping to include metadata fields for uploaded documents")
+        except Exception as e:
+            logger.warning(f"Could not update mapping for metadata fields: {e}")
 
     def _create_rrf_pipeline(self, force: bool = False) -> bool:
         """Create RRF search pipeline for native hybrid search.
@@ -183,6 +219,7 @@ class OpenSearchClient:
         latest: bool = False,
         use_hybrid: bool = True,
         min_score: float = 0.0,
+        document_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Unified search method supporting BM25, vector, and hybrid modes.
 
@@ -197,13 +234,28 @@ class OpenSearchClient:
         :returns: Search results
         """
         try:
-            # If no embedding provided or hybrid disabled, use BM25 only
-            if not query_embedding or not use_hybrid:
-                return self._search_bm25_only(query=query, size=size, from_=from_, categories=categories, latest=latest)
+            # If no embedding provided or hybrid disabled, or scoping to a document, use BM25 with filters
+            if not query_embedding or not use_hybrid or document_id:
+                results = self._search_bm25_only(query=query, size=size, from_=from_, categories=categories, latest=latest)
+                # When scoping to a specific uploaded document, filter results by metadata.document_id
+                if document_id and results.get("hits"):
+                    filtered_hits = []
+                    for hit in results["hits"]:
+                        md = hit.get("metadata", {})
+                        if md.get("document_id") == document_id:
+                            filtered_hits.append(hit)
+                    results["hits"] = filtered_hits
+                    results["total"] = len(filtered_hits)
+                return results
 
             # Use native OpenSearch hybrid search with RRF pipeline
             return self._search_hybrid_native(
-                query=query, query_embedding=query_embedding, size=size, categories=categories, min_score=min_score
+                query=query,
+                query_embedding=query_embedding,
+                size=size,
+                categories=categories,
+                min_score=min_score,
+                document_id=document_id,
             )
 
         except Exception as e:
@@ -211,7 +263,7 @@ class OpenSearchClient:
             return {"total": 0, "hits": []}
 
     def _search_bm25_only(
-        self, query: str, size: int, from_: int, categories: Optional[List[str]], latest: bool
+        self, query: str, size: int, from_: int, categories: Optional[List[str]], latest: bool, document_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Pure BM25 search implementation."""
         builder = QueryBuilder(
@@ -223,6 +275,12 @@ class OpenSearchClient:
             search_chunks=True,  # Enable chunk search mode
         )
         search_body = builder.build()
+
+        # Inject document_id filter if provided
+        if document_id:
+            bool_part = search_body.setdefault("query", {}).setdefault("bool", {})
+            filters = bool_part.setdefault("filter", [])
+            filters.append({"term": {"metadata.document_id.keyword": document_id}})
 
         response = self.client.search(index=self.index_name, body=search_body)
 
@@ -242,7 +300,13 @@ class OpenSearchClient:
         return results
 
     def _search_hybrid_native(
-        self, query: str, query_embedding: List[float], size: int, categories: Optional[List[str]], min_score: float
+        self,
+        query: str,
+        query_embedding: List[float],
+        size: int,
+        categories: Optional[List[str]],
+        min_score: float,
+        document_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Native OpenSearch hybrid search with RRF pipeline."""
         builder = QueryBuilder(
@@ -262,6 +326,10 @@ class OpenSearchClient:
         }
 
         # Execute search with RRF pipeline
+        # Apply a post_filter to scope by document_id (affects both BM25 and vector components)
+        if document_id:
+            search_body["post_filter"] = {"term": {"metadata.document_id.keyword": document_id}}
+
         response = self.client.search(
             index=self.index_name, body=search_body, params={"search_pipeline": HYBRID_RRF_PIPELINE["id"]}
         )
@@ -340,6 +408,30 @@ class OpenSearchClient:
 
         except Exception as e:
             logger.error(f"Bulk chunk indexing error: {e}")
+            raise
+
+    def bulk_index_chunks_text_only(self, chunks: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Bulk index multiple chunks without embeddings (BM25-only).
+
+        :param chunks: List of dicts with 'chunk_data' (no embedding field)
+        :returns: Statistics
+        """
+        from opensearchpy import helpers
+
+        try:
+            actions = []
+            for chunk in chunks:
+                chunk_data = chunk["chunk_data"].copy()
+                action = {"_index": self.index_name, "_source": chunk_data}
+                actions.append(action)
+
+            success, failed = helpers.bulk(self.client, actions, refresh=True)
+
+            logger.info(f"Bulk indexed (text-only) {success} chunks, {len(failed)} failed")
+            return {"success": success, "failed": len(failed)}
+
+        except Exception as e:
+            logger.error(f"Bulk chunk indexing (text-only) error: {e}")
             raise
 
     def delete_paper_chunks(self, arxiv_id: str) -> bool:

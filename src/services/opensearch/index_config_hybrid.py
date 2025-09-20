@@ -65,6 +65,14 @@ ARXIV_PAPERS_CHUNKS_MAPPING = {
             "embedding_model": {"type": "keyword"},
             "created_at": {"type": "date"},
             "updated_at": {"type": "date"},
+            "metadata": {
+                "type": "object",
+                "dynamic": "strict",
+                "properties": {
+                    "source": {"type": "keyword"},
+                    "document_id": {"type": "keyword"}
+                }
+            },
         },
     },
 }

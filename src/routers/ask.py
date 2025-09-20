@@ -45,6 +45,9 @@ async def _prepare_chunks_and_sources(
             size=request.top_k,
             from_=0,
             categories=request.categories,
+            # MODIFICATION START: Pass the document_id to the search function
+            document_id=request.document_id,
+            # MODIFICATION END
             use_hybrid=request.use_hybrid and query_embedding is not None,
             min_score=0.0,
         )
@@ -55,22 +58,27 @@ async def _prepare_chunks_and_sources(
         sources_set = set()
 
         for hit in search_results.get("hits", []):
-            arxiv_id = hit.get("arxiv_id", "")
+            # MODIFICATION START: Handle both arXiv sources and uploaded file sources
+            source_url = ""
+            if "arxiv_id" in hit:
+                arxiv_id = hit["arxiv_id"]
+                arxiv_id_clean = arxiv_id.split("v")[0] if "v" in arxiv_id else arxiv_id
+                source_url = f"https://arxiv.org/pdf/{arxiv_id_clean}.pdf"
+                arxiv_ids.append(arxiv_id)
+            elif "source" in hit.get("metadata", {}):
+                source_url = hit["metadata"]["source"]
+            
+            if source_url:
+                sources_set.add(source_url)
+            # MODIFICATION END
 
-            # Minimal chunk data for LLM
             chunks.append(
                 {
-                    "arxiv_id": arxiv_id,
+                    "source": source_url, # Changed from arxiv_id for generality
                     "chunk_text": hit.get("chunk_text", hit.get("abstract", "")),
                 }
             )
 
-            if arxiv_id:
-                arxiv_ids.append(arxiv_id)
-                arxiv_id_clean = arxiv_id.split("v")[0] if "v" in arxiv_id else arxiv_id
-                sources_set.add(f"https://arxiv.org/pdf/{arxiv_id_clean}.pdf")
-
-        # End search span with essential metadata
         rag_tracer.end_search(search_span, chunks, arxiv_ids, search_results.get("total", 0))
 
     return chunks, list(sources_set), arxiv_ids
@@ -86,7 +94,8 @@ async def ask_question(
     cache_client: CacheDep,
 ) -> AskResponse:
     """Clean RAG endpoint with essential tracing and exact match caching."""
-
+    # This function doesn't need changes as the logic is in _prepare_chunks_and_sources
+    # which it already calls correctly.
     rag_tracer = RAGTracer(langfuse_tracer)
     start_time = time.time()
 
@@ -102,9 +111,6 @@ async def ask_question(
                         return cached_response
                 except Exception as e:
                     logger.warning(f"Cache check failed, proceeding with normal flow: {e}")
-
-            # Generate query embedding for hybrid search if needed
-            query_embedding = None
 
             # Retrieve chunks
             chunks, sources, _ = await _prepare_chunks_and_sources(
@@ -177,6 +183,7 @@ async def ask_question_stream(
     cache_client: CacheDep,
 ) -> StreamingResponse:
     """Clean streaming RAG endpoint."""
+    # This function also just needs to correctly call the modified helper.
 
     async def generate_stream():
         rag_tracer = RAGTracer(langfuse_tracer)
@@ -191,19 +198,16 @@ async def ask_question_stream(
                         if cached_response:
                             logger.info("Returning cached response for exact streaming query match")
 
-                            # Send metadata first (same format as non-cached)
                             metadata_response = {
                                 "sources": cached_response.sources,
                                 "chunks_used": cached_response.chunks_used,
                                 "search_mode": cached_response.search_mode,
                             }
                             yield f"data: {json.dumps(metadata_response)}\n\n"
-
-                            # Stream the cached response in chunks
+                            
                             for chunk in cached_response.answer.split():
                                 yield f"data: {json.dumps({'chunk': chunk + ' '})}\n\n"
-
-                            # Send completion signal with just the final answer
+                            
                             yield f"data: {json.dumps({'answer': cached_response.answer, 'done': True})}\n\n"
                             return
                     except Exception as e:
@@ -226,7 +230,6 @@ async def ask_question_stream(
                 # Build prompt
                 with rag_tracer.trace_prompt_construction(trace, chunks) as prompt_span:
                     from src.services.ollama.prompts import RAGPromptBuilder
-
                     prompt_builder = RAGPromptBuilder()
                     final_prompt = prompt_builder.create_rag_prompt(request.query, chunks)
                     rag_tracer.end_prompt(prompt_span, final_prompt)
@@ -246,7 +249,7 @@ async def ask_question_stream(
                             rag_tracer.end_generation(gen_span, full_response, request.model)
                             yield f"data: {json.dumps({'answer': full_response, 'done': True})}\n\n"
                             break
-
+                
                 rag_tracer.end_request(trace, full_response, time.time() - start_time)
 
                 # Store response in exact match cache
@@ -263,7 +266,7 @@ async def ask_question_stream(
                         await cache_client.store_response(request, response_to_cache)
                     except Exception as e:
                         logger.warning(f"Failed to store streaming response in cache: {e}")
-
+            
             except Exception as e:
                 logger.error(f"Streaming error: {e}")
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"

@@ -3,13 +3,14 @@ from typing import Dict, List, Optional
 
 from src.services.embeddings.jina_client import JinaEmbeddingsClient
 from src.services.opensearch.client import OpenSearchClient
+from src.schemas.pdf_parser.models import PdfContent
 
 from .text_chunker import TextChunker
 
 logger = logging.getLogger(__name__)
 
 
-class HybridIndexingService:
+class HybridIndexerService:
     """Service for indexing papers with chunking and embeddings for hybrid search.
 
     Orchestrates the process of:
@@ -168,3 +169,116 @@ class HybridIndexingService:
 
         # Index with new data
         return await self.index_paper(paper_data)
+
+    async def index_uploaded_document(self, document_id: str, source: str, pdf_content: PdfContent) -> Dict[str, int]:
+        """Index content extracted from an uploaded PDF.
+
+        This method supports two modes:
+        - Hybrid (with embeddings) if embeddings generation succeeds
+        - BM25-only fallback if embeddings fails (e.g., missing API key)
+
+        The chunks are tagged with metadata.document_id and metadata.source for scoping and provenance.
+
+        :param document_id: Unique ID for the uploaded document
+        :param source: Original filename or URL
+        :param pdf_content: Parsed PDF content
+        :returns: Indexing statistics
+        """
+        try:
+            # Build minimal paper-like data for chunking
+            # Use section list directly; TextChunker can accept list of dicts
+            sections_list = [
+                {"title": s.title, "content": s.content} for s in (pdf_content.sections or [])
+            ]
+
+            chunks = self.chunker.chunk_paper(
+                title=source or "Uploaded Document",
+                abstract="",
+                full_text=pdf_content.raw_text or "",
+                arxiv_id="",
+                paper_id=document_id,
+                sections=sections_list if sections_list else None,
+            )
+
+            if not chunks:
+                logger.warning(f"No chunks created for uploaded document {document_id}")
+                return {"chunks_created": 0, "chunks_indexed": 0, "embeddings_generated": 0, "errors": 0}
+
+            # Attempt embeddings for hybrid indexing
+            chunk_texts = [c.text for c in chunks]
+            use_embeddings = True
+            embeddings: List[List[float]] = []
+            try:
+                embeddings = await self.embeddings_client.embed_passages(texts=chunk_texts, batch_size=50)
+                if len(embeddings) != len(chunks):
+                    logger.warning(
+                        f"Embedding count mismatch for uploaded document {document_id}: {len(embeddings)} != {len(chunks)}; falling back to BM25-only"
+                    )
+                    use_embeddings = False
+            except Exception as e:
+                logger.warning(f"Embeddings unavailable for uploaded document {document_id}: {e}; using BM25-only")
+                use_embeddings = False
+
+            # Prepare chunk payloads
+            prepared = []
+            if use_embeddings:
+                for chunk, embedding in zip(chunks, embeddings):
+                    chunk_data = {
+                        "arxiv_id": "",
+                        "paper_id": document_id,
+                        "chunk_index": chunk.metadata.chunk_index,
+                        "chunk_text": chunk.text,
+                        "chunk_word_count": chunk.metadata.word_count,
+                        "start_char": chunk.metadata.start_char,
+                        "end_char": chunk.metadata.end_char,
+                        "section_title": chunk.metadata.section_title,
+                        "embedding_model": "jina-embeddings-v3",
+                        # Minimal denormalized metadata
+                        "title": source or "Uploaded Document",
+                        "authors": "",
+                        "abstract": "",
+                        "categories": [],
+                        "published_date": None,
+                        # Custom metadata for scoping and provenance
+                        "metadata": {"source": source, "document_id": document_id},
+                    }
+                    prepared.append({"chunk_data": chunk_data, "embedding": embedding})
+                results = self.opensearch_client.bulk_index_chunks(prepared)
+                return {
+                    "chunks_created": len(chunks),
+                    "chunks_indexed": results.get("success", 0),
+                    "embeddings_generated": len(embeddings),
+                    "errors": results.get("failed", 0),
+                }
+            else:
+                for chunk in chunks:
+                    chunk_data = {
+                        "arxiv_id": "",
+                        "paper_id": document_id,
+                        "chunk_index": chunk.metadata.chunk_index,
+                        "chunk_text": chunk.text,
+                        "chunk_word_count": chunk.metadata.word_count,
+                        "start_char": chunk.metadata.start_char,
+                        "end_char": chunk.metadata.end_char,
+                        "section_title": chunk.metadata.section_title,
+                        # Minimal denormalized metadata
+                        "title": source or "Uploaded Document",
+                        "authors": "",
+                        "abstract": "",
+                        "categories": [],
+                        "published_date": None,
+                        # Custom metadata for scoping and provenance
+                        "metadata": {"source": source, "document_id": document_id},
+                    }
+                    prepared.append({"chunk_data": chunk_data})
+                results = self.opensearch_client.bulk_index_chunks_text_only(prepared)
+                return {
+                    "chunks_created": len(chunks),
+                    "chunks_indexed": results.get("success", 0),
+                    "embeddings_generated": 0,
+                    "errors": results.get("failed", 0),
+                }
+
+        except Exception as e:
+            logger.error(f"Error indexing uploaded document {document_id}: {e}")
+            return {"chunks_created": 0, "chunks_indexed": 0, "embeddings_generated": 0, "errors": 1}

@@ -11,6 +11,7 @@ class AskRequest(BaseModel):
     use_hybrid: bool = Field(True, description="Use hybrid search (BM25 + vector)")
     model: str = Field("llama3.2:1b", description="Ollama model to use for generation")
     categories: Optional[List[str]] = Field(None, description="Filter by arXiv categories")
+    document_id: Optional[str] = Field(None, description="Optional ID to scope the search to a single document.")
 
     class Config:
         json_schema_extra = {
@@ -20,6 +21,7 @@ class AskRequest(BaseModel):
                 "use_hybrid": True,
                 "model": "llama3.2:1b",
                 "categories": ["cs.AI", "cs.LG"],
+                "document_id": "1234567890",
             }
         }
 

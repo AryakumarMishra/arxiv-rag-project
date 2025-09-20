@@ -92,6 +92,73 @@ class QueryBuilder:
             bool_query["filter"] = filter_clauses
 
         return {"bool": bool_query}
+    
+
+
+
+    def build_hybrid_query(
+        self,
+        query_text: str,
+        query_vector: List[float],
+        top_k: int = 5,
+        categories: Optional[List[str]] = None,
+        document_id: Optional[str] = None,
+    ) -> Dict:
+        """
+        Builds a complete hybrid search query for the RAG endpoint.
+        """
+        # STEP 1: Define the base structure of the hybrid query. This was missing.
+        search_query = {
+            "size": top_k,
+            "query": {
+                "hybrid": {
+                    "queries": [
+                        {
+                            "bool": {
+                                "must": [
+                                    {
+                                        "multi_match": {
+                                            "query": query_text,
+                                            "fields": ["chunk_text^3", "title^2", "abstract"],
+                                            "fuzziness": "AUTO",
+                                        }
+                                    }
+                                ],
+                                # We will add the filter clause here later
+                            }
+                        },
+                        {
+                            "knn": {
+                                "embedding": {
+                                    "vector": query_vector,
+                                    "k": top_k
+                                }
+                            }
+                        },
+                    ]
+                }
+            },
+            "_source": {"excludes": ["embedding"]},
+        }
+
+        # STEP 2: Your filtering logic, which was correct, is now added.
+        filters = []
+        if categories:
+            filters.append({"terms": {"metadata.categories": categories}})
+        if document_id:
+            # This line is perfect!
+            filters.append({"term": {"metadata.document_id.keyword": document_id}})
+
+        # STEP 3: Attach the filters to the base query structure.
+        if filters:
+            # Correctly place the filter list inside the 'bool' part of the query
+            search_query["query"]["hybrid"]["queries"][0]["bool"]["filter"] = filters
+
+        return search_query
+
+
+
+
 
     def _build_text_query(self) -> Dict[str, Any]:
         """Build the main text search query.
