@@ -54,7 +54,8 @@ services:
     container_name: rag-opensearch
     environment:
       - discovery.type=single-node
-      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+      # INCREASED MEMORY TO PREVENT "STUCK LOADING"
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
       - DISABLE_SECURITY_PLUGIN=true
       - bootstrap.memory_lock=true
     ports:
@@ -109,7 +110,7 @@ services:
     environment:
       # Airflow-specific environment setup
       - AIRFLOW_HOME=/opt/airflow
-      - PYTHONPATH=/opt/airflow/src
+      - PYTHONPATH=/opt/airflow/src:/opt/airflow/dags
       # Container hostnames for Airflow
       - POSTGRES_DATABASE_URL=postgresql+psycopg2://rag_user:rag_password@postgres:5432/rag_db
       - OPENSEARCH_HOST=http://opensearch:9200
@@ -148,6 +149,14 @@ services:
       start_period: 30s
     networks:
       - rag-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
 
   postgres:
     image: postgres:16-alpine
@@ -176,6 +185,10 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:24.8-alpine
     container_name: rag-clickhouse
+    # ADDED PORTS TO MAKE IT ACCESSIBLE FROM LOCALHOST
+    ports:
+      - "8123:8123"
+      - "9000:9000"
     environment:
       - CLICKHOUSE_DB=langfuse
       - CLICKHOUSE_USER=langfuse
@@ -206,10 +219,10 @@ services:
       - NODE_ENV=production
       - DATABASE_URL=postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
       - NEXTAUTH_URL=http://localhost:3000
-      - NEXTAUTH_SECRET=changeThisToASecureRandomString32CharsMin  
-      - SALT=changeThisToAnotherSecureRandomString 
-      - TELEMETRY_ENABLED=false  
-      - NEXT_PUBLIC_SIGN_UP_DISABLED=false 
+      - NEXTAUTH_SECRET=changeThisToASecureRandomString32CharsMin
+      - SALT=changeThisToAnotherSecureRandomString
+      - TELEMETRY_ENABLED=false
+      - NEXT_PUBLIC_SIGN_UP_DISABLED=false
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:3000/api/public/health || exit 1"]
       interval: 30s
@@ -240,6 +253,16 @@ services:
     restart: unless-stopped
     networks:
       - rag-network
+    
+  gradio:
+    build:
+      context: .
+      dockerfile: gradio.Dockerfile
+    container_name: rag-gradio
+    ports:
+      - "7861:7861"
+    networks:
+      - rag-network
 
 
 volumes:
@@ -253,4 +276,4 @@ volumes:
 
 networks:
   rag-network:
-    driver: bridge 
+    driver: bridge
