@@ -1,11 +1,28 @@
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Iterator
 
 import gradio as gr
 import httpx
 
+# Create logs directory if it doesn't exist
+log_dir = Path("logs")
+log_dir.mkdir(exist_ok=True)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_dir / 'gradio_app.log'),
+        logging.StreamHandler()
+    ]
+)
+
 logger = logging.getLogger(__name__)
+logger.info("Gradio app logging initialized")
 
 # --- Configuration ---
 API_BASE_URL = "http://api:8000/api/v1"
@@ -27,30 +44,57 @@ async def upload_pdf_to_api(pdf_file, progress=gr.Progress(track_tqdm=True)):
     
     try:
         # Gradio provides a temporary path to the uploaded file
-        files = {'file': (pdf_file.name, open(pdf_file.name, 'rb'), 'application/pdf')}
+        logger.info(f"Processing PDF: {pdf_file.name}")
         
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        # Read the file content first to ensure it's accessible
+        try:
+            with open(pdf_file.name, 'rb') as f:
+                file_content = f.read()
+            files = {'file': (pdf_file.name, file_content, 'application/pdf')}
+        except Exception as file_error:
+            logger.error(f"Error reading PDF file: {file_error}", exc_info=True)
+            return f"❌ Error reading PDF file: {file_error}", gr.update(interactive=False), gr.update(interactive=False)
+        
+        async with httpx.AsyncClient(timeout=500.0) as client:
             progress(0, desc="Uploading and processing PDF...")
-            response = await client.post(upload_url, files=files)
-            progress(1, desc="Processing complete!")
-
-            if response.status_code == 200:
-                result = response.json()
-                document_context["id"] = result.get("document_id")
-                # Return a success message and enable the chat components
-                return f"✅ **{pdf_file.name}** processed! You can now ask questions about it.", gr.update(interactive=True), gr.update(interactive=True)
-            else:
-                # Return an error and keep chat disabled
-                return f"⚠️ Error processing PDF: {response.text}", gr.update(interactive=False), gr.update(interactive=False)
+            try:
+                response = await client.post(upload_url, files=files)
+                logger.info(f"Upload response status: {response.status_code}")
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    document_id = result.get("document_id")
+                    if not document_id:
+                        logger.error("No document_id in response")
+                        return "⚠️ Error: No document ID received from server", gr.update(interactive=False), gr.update(interactive=False)
+                        
+                    document_context["id"] = document_id
+                    logger.info(f"PDF processed successfully. Document ID: {document_id}")
+                    return f"✅ **{pdf_file.name}** processed! You can now ask questions about it.", gr.update(interactive=True), gr.update(interactive=True)
+                else:
+                    error_msg = f"⚠️ Error processing PDF (Status {response.status_code}): {response.text}"
+                    logger.error(error_msg)
+                    return error_msg, gr.update(interactive=False), gr.update(interactive=False)
+                    
+            except httpx.RequestError as e:
+                error_msg = f"⚠️ Connection error: {str(e)}\nPlease make sure the API server is running."
+                logger.error(error_msg, exc_info=True)
+                return error_msg, gr.update(interactive=False), gr.update(interactive=False)
                 
     except Exception as e:
-        logger.error(f"An unexpected error occurred during upload: {e}", exc_info=True)
-        return f"❌ An unexpected error occurred: {e}", gr.update(interactive=False), gr.update(interactive=False)
+        error_msg = f"❌ An unexpected error occurred: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return error_msg, gr.update(interactive=False), gr.update(interactive=False)
 
 async def stream_response(query: str, top_k: int, use_hybrid: bool, model: str) -> Iterator[str]:
     """Streams the RAG response from the API, filtering by document_id if available."""
     if not query.strip():
         yield "Please enter a question."
+        return
+
+    # For PDF chat, we need a document_id
+    if document_context.get("id") is None and not query.strip().lower().startswith(('what', 'who', 'when', 'where', 'why', 'how', 'is', 'are', 'can', 'could', 'would', 'will', 'do', 'does', 'did')):
+        yield "Error: No document context found. Please upload and process a PDF first."
         return
 
     payload = {
@@ -59,59 +103,96 @@ async def stream_response(query: str, top_k: int, use_hybrid: bool, model: str) 
         "use_hybrid": use_hybrid,
         "model": model,
         "document_id": document_context.get("id"),  # Pass the stored document_id
-        "categories": None, # Explicitly set categories to None for PDF chat
+        "categories": None if document_context.get("id") else None,  # Only set categories to None for PDF chat
     }
     
     url = f"{API_BASE_URL}/stream"
     current_answer = ""
     final_metadata = ""
+    
+    logger.info(f"Sending request to {url} with payload: {payload}")
 
     try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            async with client.stream("POST", url, json=payload, headers={"Accept": "text/plain"}) as response:
-                if response.status_code != 200:
-                    yield f"Error: API returned status {response.status_code}"
-                    return
+        async with httpx.AsyncClient(timeout=500.0) as client:
+            try:
+                async with client.stream("POST", url, json=payload, headers={"Accept": "text/plain"}) as response:
+                    if response.status_code != 200:
+                        error_msg = f"Error: API returned status {response.status_code}"
+                        try:
+                            error_details = await response.aread()
+                            error_msg += f"\nDetails: {error_details.decode()}"
+                        except:
+                            pass
+                        logger.error(error_msg)
+                        yield error_msg
+                        return
 
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
+                    logger.info(f"Streaming response from {url}")
                     
-                    data_str = line[6:]
-                    try:
-                        data = json.loads(data_str)
-                        if "chunk" in data:
-                            current_answer += data["chunk"]
-                            yield current_answer
-                        if "sources" in data:
-                            sources = data["sources"]
-                            chunks_used = data.get("chunks_used", 0)
-                            search_mode = data.get("search_mode", "unknown")
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data: "):
+                            logger.debug(f"Skipping non-data line: {line}")
+                            continue
+                        
+                        data_str = line[6:].strip()
+                        if not data_str:  # Skip empty data lines
+                            continue
                             
-                            metadata_parts = ["\n\n---", f"**Search Info:** Mode: *{search_mode}*, Chunks used: *{chunks_used}*"]
-                            if sources:
-                                metadata_parts.append("\n**Sources:**")
-                                for i, source in enumerate(sources, 1):
-                                    # Display filename for uploaded docs, link for arXiv
-                                    source_name = source if not source.startswith("http") else source.split('/')[-1]
-                                    metadata_parts.append(f"  {i}. {source_name}")
-                            final_metadata = "\n".join(metadata_parts)
-                        if "error" in data:
-                            yield f"Error: {data['error']}"
-                            return
-                        if data.get("done", False):
-                            current_answer = data.get("answer", current_answer)
-                            break
-                    except json.JSONDecodeError:
-                        continue
-    except httpx.RequestError as e:
-        yield f"Connection error: {str(e)}\nMake sure the API server is running."
-        return
+                        try:
+                            data = json.loads(data_str)
+                            logger.debug(f"Received data: {data}")
+                            
+                            if "chunk" in data:
+                                current_answer += data["chunk"]
+                                yield current_answer
+                                
+                            if "sources" in data:
+                                sources = data["sources"]
+                                chunks_used = data.get("chunks_used", 0)
+                                search_mode = data.get("search_mode", "unknown")
+                                
+                                metadata_parts = ["\n\n---", f"**Search Info:** Mode: *{search_mode}*, Chunks used: *{chunks_used}*"]
+                                if sources:
+                                    metadata_parts.append("\n**Sources:**")
+                                    for i, source in enumerate(sources, 1):
+                                        # Display filename for uploaded docs, link for arXiv
+                                        source_name = source if not source.startswith("http") else source.split('/')[-1]
+                                        metadata_parts.append(f"  {i}. {source_name}")
+                                final_metadata = "\n".join(metadata_parts)
+                                logger.debug(f"Updated metadata: {final_metadata}")
+                                
+                            if "error" in data:
+                                error_msg = f"Error: {data['error']}"
+                                logger.error(error_msg)
+                                yield error_msg
+                                return
+                                
+                            if data.get("done", False):
+                                current_answer = data.get("answer", current_answer)
+                                logger.info("Received done signal from server")
+                                break
+                                
+                        except json.JSONDecodeError as e:
+                            logger.error(f"JSON decode error for line: {line}")
+                            logger.error(f"Error: {str(e)}")
+                            continue
+                            
+            except httpx.RequestError as e:
+                error_msg = f"Connection error: {str(e)}\nMake sure the API server is running."
+                logger.error(error_msg, exc_info=True)
+                yield error_msg
+                return
+                
     except Exception as e:
-        yield f"An unexpected error occurred: {str(e)}"
+        error_msg = f"An unexpected error occurred: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        yield error_msg
         return
 
-    yield current_answer + final_metadata
+    # Final response with metadata
+    full_response = current_answer + final_metadata
+    logger.info(f"Streaming complete. Response length: {len(full_response)} characters")
+    yield full_response
 
 # --- Gradio UI Layout ---
 def create_gradio_interface():
